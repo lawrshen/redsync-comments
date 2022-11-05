@@ -15,22 +15,22 @@ type DelayFunc func(tries int) time.Duration
 
 // A Mutex is a distributed mutual exclusion lock.
 type Mutex struct {
-	name   string
-	expiry time.Duration
+	name   string        // key in redis
+	expiry time.Duration // key expiry time
 
-	tries     int
-	delayFunc DelayFunc
+	tries     int       // retry times
+	delayFunc DelayFunc // random delay
 
-	driftFactor   float64
-	timeoutFactor float64
+	driftFactor   float64 // clock drift factor
+	timeoutFactor float64 // timeout factor for acquiring a lock (pull#80)
 
-	quorum int
+	quorum int // N/2 + 1
 
-	genValueFunc func() (string, error)
-	value        string
-	until        time.Time
+	genValueFunc func() (string, error) // generate unique value
+	value        string                 // value in redis
+	until        time.Time              // lock validity time
 
-	pools []redis.Pool
+	pools []redis.Pool // N redis instances connection pool
 }
 
 // Name returns mutex name (i.e. the Redis key).
@@ -65,20 +65,27 @@ func (m *Mutex) LockContext(ctx context.Context) error {
 	}
 
 	for i := 0; i < m.tries; i++ {
+		// Retry on Failure
 		if i != 0 {
 			select {
 			case <-ctx.Done():
 				// Exit early if the context is done.
 				return ErrFailed
 			case <-time.After(m.delayFunc(i)):
+				// a random delay in order to try to desynchronize multiple clients 
+				// trying to acquire the lock for the same resource at the same time
 				// Fall-through when the delay timer completes.
 			}
 		}
 
+		// Redlock Step#1 gets the current time in milliseconds.
 		start := time.Now()
 
+		// Redlock Step#2 tries to acquire the lock in all the N instances sequentially
 		n, err := func() (int, error) {
-			ctx, cancel := context.WithTimeout(ctx, time.Duration(int64(float64(m.expiry)*m.timeoutFactor)))
+			// use anonymous function to avoid memory bloat by defer in for.
+			// acquire the lock with timeout
+			ctx, cancel := context.WithTimeout(ctx, time.Duration(int64(float64(m.expiry)*m.timeoutFactor))) // about 500 milliseconds
 			defer cancel()
 			return m.actOnPoolsAsync(func(pool redis.Pool) (bool, error) {
 				return m.acquire(ctx, pool, value)
@@ -88,13 +95,16 @@ func (m *Mutex) LockContext(ctx context.Context) error {
 			return err
 		}
 
+		// Redlock Step#3 computes how much time elapsed in order to acquire the lock
 		now := time.Now()
 		until := now.Add(m.expiry - now.Sub(start) - time.Duration(int64(float64(m.expiry)*m.driftFactor)))
 		if n >= m.quorum && now.Before(until) {
+			// Redlock Step#4 validity time is considered to be the initial validity time minus the time elapsed
 			m.value = value
 			m.until = until
 			return nil
 		}
+		// Redlock Step#5 failed to acquire the lock, try to unlock all the instances
 		_, err = func() (int, error) {
 			ctx, cancel := context.WithTimeout(ctx, time.Duration(int64(float64(m.expiry)*m.timeoutFactor)))
 			defer cancel()
@@ -250,6 +260,7 @@ func (m *Mutex) touch(ctx context.Context, pool redis.Pool, value string, expiry
 	return status != int64(0), nil
 }
 
+// multiplexing to improve performance
 func (m *Mutex) actOnPoolsAsync(actFn func(redis.Pool) (bool, error)) (int, error) {
 	type result struct {
 		Status bool
